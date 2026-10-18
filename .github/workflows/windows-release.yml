@@ -1,14 +1,18 @@
 name: Windows Release
 
+# Tag pushes keep the release behavior. Manual runs build the ref supplied in
+# "ref" (defaults to the experimental expr/gjxl branch) and only upload
+# artifacts, unless the ref itself is a vX.Y.Z tag.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag to build, for example v1.0.1"
-        required: true
+      ref:
+        description: "Branch, tag, or commit SHA to build."
+        required: false
+        default: "expr/gjxl"
         type: string
 
 permissions:
@@ -25,36 +29,40 @@ jobs:
       DIST_DIR: ${{ github.workspace }}\oimg\dist\windows
 
     steps:
-      - name: Resolve release tag
+      - name: Resolve build ref
         id: release
         shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $tag = "${{ inputs.tag }}"
-            $checkoutRef = "${{ github.ref_name }}"
-          } else {
-            $tag = $env:GITHUB_REF_NAME
-            $checkoutRef = $tag
-          }
-
-          if ($tag -notmatch '^v[0-9]+[.][0-9]+[.][0-9]+([-.][0-9A-Za-z.-]+)?$') {
-            throw "Release tag must look like v1.2.3, got: $tag"
-          }
-
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$($tag.Substring(1))" >> $env:GITHUB_OUTPUT
-          "checkout_ref=$checkoutRef" >> $env:GITHUB_OUTPUT
-
-      - name: Validate required secrets
-        shell: pwsh
         env:
-          CI_REPO_TOKEN: ${{ secrets.CI_REPO_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCHED_REF: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:CI_REPO_TOKEN)) {
-            throw "Missing required secret: CI_REPO_TOKEN"
+
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $checkoutRef = "$env:INPUT_REF".Trim()
+            if ([string]::IsNullOrWhiteSpace($checkoutRef)) {
+              $checkoutRef = $env:DISPATCHED_REF
+            }
+          } else {
+            $checkoutRef = $env:GITHUB_REF_NAME
           }
+
+          if ([string]::IsNullOrWhiteSpace($checkoutRef)) {
+            throw "Could not determine which Git ref to build."
+          }
+
+          # Treat refs that look like release tags as tagged builds.
+          $tag = ""
+          $version = ""
+          if ($checkoutRef -match '^v[0-9]+[.][0-9]+[.][0-9]+([-.][0-9A-Za-z.-]+)?$') {
+            $tag = $checkoutRef
+            $version = $checkoutRef.Substring(1)
+          }
+
+          "checkout_ref=$checkoutRef" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Checkout oimg
         uses: actions/checkout@v6
@@ -64,7 +72,7 @@ jobs:
           fetch-depth: 0
 
       - name: Validate tag is on main
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && steps.release.outputs.tag != ''
         shell: pwsh
         working-directory: oimg
         run: |
@@ -76,13 +84,35 @@ jobs:
             throw "Release tag ${{ steps.release.outputs.tag }} must point to a commit reachable from origin/main."
           }
 
+      - name: Resolve dependency refs
+        id: deps
+        shell: pwsh
+        env:
+          BUILD_REF: ${{ steps.release.outputs.checkout_ref }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $buildRef = "$env:BUILD_REF".Trim()
+
+          # expr/gjxl requires the experimental Slimg commit it pins; every
+          # other ref keeps following Slimg main.
+          if ($buildRef -match '(^|/)expr/gjxl$') {
+            $slimgRef = "7e39c9353c2c0c493245a53ec7574e39b23a9ed4"
+          } else {
+            $slimgRef = "main"
+          }
+
+          "slimg_ref=$slimgRef" >> $env:GITHUB_OUTPUT
+
+      # CI_REPO_TOKEN is optional: the sibling repositories are public, so the
+      # default token can read them on a fork. Set the secret only when they
+      # are private.
       - name: Checkout slimg
         uses: actions/checkout@v6
         with:
           repository: yunho-c/slimg
-          ref: main
+          ref: ${{ steps.deps.outputs.slimg_ref }}
           path: slimg
-          token: ${{ secrets.CI_REPO_TOKEN }}
+          token: ${{ secrets.CI_REPO_TOKEN || github.token }}
           submodules: recursive
 
       - name: Checkout tjdistler-iqa-fork
@@ -91,7 +121,7 @@ jobs:
           repository: yunho-c/tjdistler-iqa-fork
           ref: perf/simd-gaussian-vertical
           path: tjdistler-iqa-fork
-          token: ${{ secrets.CI_REPO_TOKEN }}
+          token: ${{ secrets.CI_REPO_TOKEN || github.token }}
 
       - name: Checkout irondash
         uses: actions/checkout@v6
@@ -99,11 +129,14 @@ jobs:
           repository: yunho-c/irondash
           ref: fix/macos-engine-context-race
           path: irondash
-          token: ${{ secrets.CI_REPO_TOKEN }}
+          token: ${{ secrets.CI_REPO_TOKEN || github.token }}
 
-      - name: Validate pubspec version
+      - name: Resolve build version
+        id: version
         shell: pwsh
         working-directory: oimg
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
           $line = Get-Content pubspec.yaml | Where-Object { $_ -match '^version:\s*(\S+)' } | Select-Object -First 1
@@ -111,11 +144,20 @@ jobs:
             throw "Could not read version from pubspec.yaml"
           }
 
-          $pubspecVersion = $Matches[1]
-          $tagVersion = "${{ steps.release.outputs.version }}"
-          if ($pubspecVersion -ne $tagVersion) {
-            throw "Tag version ($tagVersion) does not match pubspec.yaml ($pubspecVersion)"
+          $pubspecVersion = $Matches[1].Trim()
+          if ($pubspecVersion -notmatch '^[0-9]+[.][0-9]+[.][0-9]+$') {
+            throw "pubspec.yaml version must be numeric, got: $pubspecVersion"
           }
+
+          $releaseVersion = "$env:RELEASE_VERSION".Trim()
+          if ([string]::IsNullOrWhiteSpace($releaseVersion)) {
+            # Manual branch builds name artifacts from pubspec.yaml.
+            $releaseVersion = $pubspecVersion
+          } elseif ($releaseVersion -ne $pubspecVersion) {
+            throw "Tag version ($releaseVersion) does not match pubspec.yaml ($pubspecVersion)"
+          }
+
+          "version=$releaseVersion" >> $env:GITHUB_OUTPUT
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -183,7 +225,7 @@ jobs:
             throw "Expected Windows executable not found: $exePath"
           }
 
-          $zipPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.release.outputs.version }}-windows-x64.zip"
+          $zipPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.version.outputs.version }}-windows-x64.zip"
           if (Test-Path $zipPath) {
             Remove-Item $zipPath
           }
@@ -199,7 +241,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           powershell -ExecutionPolicy Bypass -File scripts/windows/package_inno_installer.ps1 `
-            -Version "${{ steps.release.outputs.version }}" `
+            -Version "${{ steps.version.outputs.version }}" `
             -OutputDir $env:DIST_DIR
 
       - name: Build Microsoft Store app
@@ -217,7 +259,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
 
-          $msixVersion = "${{ steps.release.outputs.version }}.0"
+          $msixVersion = "${{ steps.version.outputs.version }}.0"
           dart run msix:create --version $msixVersion
 
           $generatedMsix = Get-ChildItem "build\windows\x64\msix" -Filter "*.msix" | Sort-Object LastWriteTime | Select-Object -Last 1
@@ -225,7 +267,7 @@ jobs:
             throw "Expected MSIX artifact not found in build\windows\x64\msix"
           }
 
-          $msixPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.release.outputs.version }}-windows-x64.msix"
+          $msixPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.version.outputs.version }}-windows-x64.msix"
           if (Test-Path $msixPath) {
             Remove-Item $msixPath
           }
@@ -240,11 +282,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $releaseDir = "build\windows\x64\runner\Release"
-          $zipPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.release.outputs.version }}-windows-x64.zip"
+          $zipPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.version.outputs.version }}-windows-x64.zip"
           $shaPath = "$zipPath.sha256"
-          $setupPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.release.outputs.version }}-windows-x64-setup.exe"
+          $setupPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.version.outputs.version }}-windows-x64-setup.exe"
           $setupShaPath = "$setupPath.sha256"
-          $msixPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.release.outputs.version }}-windows-x64.msix"
+          $msixPath = Join-Path $env:DIST_DIR "OIMG-${{ steps.version.outputs.version }}-windows-x64.msix"
           $msixShaPath = "$msixPath.sha256"
 
           foreach ($path in @((Join-Path $releaseDir "oimg.exe"), $zipPath, $shaPath, $setupPath, $setupShaPath, $msixPath, $msixShaPath)) {
@@ -256,7 +298,7 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          name: OIMG-${{ steps.release.outputs.version }}-windows-x64
+          name: OIMG-${{ steps.version.outputs.version }}-windows-x64
           path: |
             oimg/dist/windows/*.zip
             oimg/dist/windows/*.exe
@@ -265,7 +307,7 @@ jobs:
           if-no-files-found: error
 
       - name: Create draft GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && steps.release.outputs.tag != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
